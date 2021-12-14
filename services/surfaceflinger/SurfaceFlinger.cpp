@@ -137,6 +137,14 @@
 #include "android-base/stringprintf.h"
 #include "android-base/strings.h"
 
+#ifdef QCOM_UM_FAMILY
+#if __has_include("QtiGralloc.h")
+#include "QtiGralloc.h"
+#else
+#include "gralloc_priv.h"
+#endif
+#endif
+
 #define MAIN_THREAD ACQUIRE(mStateLock) RELEASE(mStateLock)
 
 #define ON_MAIN_THREAD(expr)                                       \
@@ -591,8 +599,10 @@ void SurfaceFlinger::enableHalVirtualDisplays(bool enable) {
 }
 
 VirtualDisplayId SurfaceFlinger::acquireVirtualDisplay(ui::Size resolution, ui::PixelFormat format,
-                                                       ui::LayerStack layerStack) {
-    if (auto& generator = mVirtualDisplayIdGenerators.hal) {
+                                                       ui::LayerStack layerStack,
+                                                       bool canAllocateHwcForVDS) {
+    auto& generator = mVirtualDisplayIdGenerators.hal;
+    if (canAllocateHwcForVDS && generator) {
         if (const auto id = generator->generateId()) {
             std::optional<PhysicalDisplayId> mirror;
 
@@ -651,6 +661,17 @@ std::vector<PhysicalDisplayId> SurfaceFlinger::getPhysicalDisplayIds() const {
     }
 
     return displayIds;
+}
+
+status_t SurfaceFlinger::getPrimaryPhysicalDisplayId(PhysicalDisplayId* id) const {
+    Mutex::Autolock lock(mStateLock);
+    const auto display = getInternalDisplayIdLocked();
+    if (!display) {
+        return NAME_NOT_FOUND;
+    }
+
+    *id = *display;
+    return NO_ERROR;
 }
 
 sp<IBinder> SurfaceFlinger::getPhysicalDisplayToken(PhysicalDisplayId displayId) const {
@@ -1822,11 +1843,8 @@ void SurfaceFlinger::setVsyncEnabled(bool enabled) {
 }
 
 SurfaceFlinger::FenceWithFenceTime SurfaceFlinger::previousFrameFence() {
-    const auto now = systemTime();
-    const auto vsyncPeriod = mScheduler->getDisplayStatInfo(now).vsyncPeriod;
-    const bool expectedPresentTimeIsTheNextVsync = mExpectedPresentTime - now <= vsyncPeriod;
-    return expectedPresentTimeIsTheNextVsync ? mPreviousPresentFences[0]
-                                             : mPreviousPresentFences[1];
+     return mVsyncModulator->getVsyncConfig().sfOffset >= 0 ? mPreviousPresentFences[0]
+                                                           : mPreviousPresentFences[1];
 }
 
 bool SurfaceFlinger::previousFramePending(int graceTimeMs) {
@@ -2730,6 +2748,11 @@ sp<DisplayDevice> SurfaceFlinger::setupNewDisplayDeviceInternal(
 
 void SurfaceFlinger::processDisplayAdded(const wp<IBinder>& displayToken,
                                          const DisplayDeviceState& state) {
+#ifdef QCOM_UM_FAMILY
+    bool canAllocateHwcForVDS = false;
+#else
+    bool canAllocateHwcForVDS = true;
+#endif
     ui::Size resolution(0, 0);
     ui::PixelFormat pixelFormat = static_cast<ui::PixelFormat>(PIXEL_FORMAT_UNKNOWN);
     if (state.physical) {
@@ -2744,6 +2767,22 @@ void SurfaceFlinger::processDisplayAdded(const wp<IBinder>& displayToken,
         status = state.surface->query(NATIVE_WINDOW_FORMAT, &format);
         ALOGE_IF(status != NO_ERROR, "Unable to query format (%d)", status);
         pixelFormat = static_cast<ui::PixelFormat>(format);
+#ifdef QCOM_UM_FAMILY
+        if (mVirtualDisplayIdGenerators.hal) {
+            size_t maxVirtualDisplaySize = getHwComposer().getMaxVirtualDisplayDimension();
+            if (maxVirtualDisplaySize == 0 ||
+                ((uint64_t)resolution.width <= maxVirtualDisplaySize &&
+                (uint64_t)resolution.height <= maxVirtualDisplaySize)) {
+                uint64_t usage = 0;
+                // Replace with native_window_get_consumer_usage ?
+                status = state .surface->getConsumerUsage(&usage);
+                ALOGW_IF(status != NO_ERROR, "Unable to query usage (%d)", status);
+                if ((status == NO_ERROR) && canAllocateHwcDisplayIdForVDS(usage)) {
+                   canAllocateHwcForVDS = true;
+               }
+            }
+        }
+#endif
     } else {
         // Virtual displays without a surface are dormant:
         // they have external state (layer stack, projection,
@@ -2756,7 +2795,8 @@ void SurfaceFlinger::processDisplayAdded(const wp<IBinder>& displayToken,
         builder.setId(physical->id);
         builder.setConnectionType(physical->type);
     } else {
-        builder.setId(acquireVirtualDisplay(resolution, pixelFormat, state.layerStack));
+        builder.setId(acquireVirtualDisplay(resolution, pixelFormat, state.layerStack,
+                                            canAllocateHwcForVDS));
     }
 
     builder.setPixels(resolution);
@@ -2777,7 +2817,8 @@ void SurfaceFlinger::processDisplayAdded(const wp<IBinder>& displayToken,
         const auto displayId = VirtualDisplayId::tryCast(compositionDisplay->getId());
         LOG_FATAL_IF(!displayId);
         auto surface = sp<VirtualDisplaySurface>::make(getHwComposer(), *displayId, state.surface,
-                                                       bqProducer, bqConsumer, state.displayName);
+                                                       bqProducer, bqConsumer, state.displayName,
+                                                       state.isSecure);
         displaySurface = surface;
         producer = std::move(surface);
     } else {
@@ -5226,6 +5267,7 @@ status_t SurfaceFlinger::CheckTransactCodeCredentials(uint32_t code) {
         case REMOVE_TUNNEL_MODE_ENABLED_LISTENER:
         case NOTIFY_POWER_BOOST:
         case SET_GLOBAL_SHADOW_SETTINGS:
+        case GET_PRIMARY_PHYSICAL_DISPLAY_ID:
         case ACQUIRE_FRAME_RATE_FLEXIBILITY_TOKEN: {
             // ACQUIRE_FRAME_RATE_FLEXIBILITY_TOKEN and OVERRIDE_HDR_TYPES are used by CTS tests,
             // which acquire the necessary permission dynamically. Don't use the permission cache
@@ -6524,6 +6566,26 @@ status_t SurfaceFlinger::setDesiredDisplayModeSpecsInternal(
 
     return NO_ERROR;
 }
+
+#ifdef QCOM_UM_FAMILY
+bool SurfaceFlinger::canAllocateHwcDisplayIdForVDS(uint64_t usage) {
+    uint64_t flag_mask_pvt_wfd = ~0;
+    uint64_t flag_mask_hw_video = ~0;
+    char value[PROPERTY_VALUE_MAX] = {};
+    property_get("vendor.display.vds_allow_hwc", value, "0");
+    int allowHwcForVDS = atoi(value);
+    // Reserve hardware acceleration for WFD use-case
+    // GRALLOC_USAGE_PRIVATE_WFD + GRALLOC_USAGE_HW_VIDEO_ENCODER = WFD using HW composer.
+    flag_mask_pvt_wfd = GRALLOC_USAGE_PRIVATE_WFD;
+    flag_mask_hw_video = GRALLOC_USAGE_HW_VIDEO_ENCODER;
+    return (allowHwcForVDS || ((usage & flag_mask_pvt_wfd) &&
+            (usage & flag_mask_hw_video)));
+}
+#else
+bool SurfaceFlinger::canAllocateHwcDisplayIdForVDS(uint64_t) {
+    return true;
+}
+#endif
 
 status_t SurfaceFlinger::setDesiredDisplayModeSpecs(
         const sp<IBinder>& displayToken, ui::DisplayModeId defaultMode, bool allowGroupSwitching,

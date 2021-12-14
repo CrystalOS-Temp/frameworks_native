@@ -1436,6 +1436,14 @@ bool InputDispatcher::dispatchKeyLocked(nsecs_t currentTime, std::shared_ptr<Key
     // Give the policy a chance to intercept the key.
     if (entry->interceptKeyResult == KeyEntry::INTERCEPT_KEY_RESULT_UNKNOWN) {
         if (entry->policyFlags & POLICY_FLAG_PASS_TO_USER) {
+            if (INPUTDISPATCHER_SKIP_EVENT_KEY != 0) {
+                if(entry->keyCode == 0 && entry->scanCode == INPUTDISPATCHER_SKIP_EVENT_KEY) {
+                    entry->interceptKeyResult = KeyEntry::INTERCEPT_KEY_RESULT_SKIP;
+                    *dropReason = DropReason::POLICY;
+                    ALOGI("Intercepted the key %i", INPUTDISPATCHER_SKIP_EVENT_KEY);
+                    return true;
+                }
+            }
             std::unique_ptr<CommandEntry> commandEntry = std::make_unique<CommandEntry>(
                     &InputDispatcher::doInterceptKeyBeforeDispatchingLockedInterruptible);
             sp<IBinder> focusedWindowToken =
@@ -3906,6 +3914,13 @@ void InputDispatcher::notifyMotion(const NotifyMotionArgs* args) {
                                               args->xCursorPosition, args->yCursorPosition,
                                               args->downTime, args->pointerCount,
                                               args->pointerProperties, args->pointerCoords, 0, 0);
+
+        if (args->id != android::os::IInputConstants::INVALID_INPUT_EVENT_ID &&
+            IdGenerator::getSource(args->id) == IdGenerator::Source::INPUT_READER &&
+            !mInputFilterEnabled) {
+            const bool isDown = args->action == AMOTION_EVENT_ACTION_DOWN;
+            mLatencyTracker.trackListener(args->id, isDown, args->eventTime, args->readTime);
+        }
 
         needWake = enqueueInboundEventLocked(std::move(newEntry));
         mLock.unlock();
